@@ -1,25 +1,52 @@
 #include "can-bridge-firmware.h"
 
-#define EXTRAGIDS	65	//65 used for 30kWh bruteforce upgrade
+//Status						
+volatile	uint8_t		poweroff					= 1;	//1 if the car is ready to go and 0 if it is stopped
+volatile	uint8_t		calibration_pending			= 1;	//1 if calibration procedure should be fired
+volatile	uint8_t		charging_state				= 0;	//current charging status
 
-//globals
-volatile	uint8_t		charging_state				= 0;
-volatile	uint8_t		voltage_samples				= 0;
-volatile	uint8_t		LBC_CapacityBars			= 0;
-volatile	uint16_t	voltage_sum					= 0;
-volatile	uint16_t	filtered_voltage			= 345; //Initialized to 345, otherwise it will be 0 for a few seconds before enough filtering has happened
+//GIDS calculation
+volatile	uint16_t	power_samples				= 0;	//Number of samples before update GIDS
+volatile	float		power_sum					= 0.0;	//Accumulator for samples
+volatile	uint16_t	total_gids					= 0;	//GIDS to be reported
+
+//LBC related data
 volatile	uint16_t	LBC_MainGids				= 0;
 volatile	uint16_t	LBC_StateOfCharge			= 0;
-volatile	uint16_t	LBC_BatteryVoltageSignal	= 0;
+volatile	uint16_t	LBC_BatteryVoltageSignal	= 0;	//LSB = 0.5V
+volatile	int16_t		LBC_BatteryCurrentSignal	= 0;	//LSB = 0.5A
+volatile	float		LBC_PowerStatus				= 0;	//Current battery charging status
 
+//Delay of charging process start
+volatile	uint16_t	charging_wait_b4_set_current = CURRENT_SET_WAITING_TIME;
 
+//Quick Charge current
+volatile	uint16_t	chademo_power_rate			= CHADEMO_MAX_CHARGE_RATE; 
 //example valid CAN frame
 volatile	can_frame_t	static_message = {.can_id = 0x5BC, .can_dlc = 8, .data = {0,0,0,0,0,0,0,0}};
 
-//USB variables
-volatile	uint8_t		configSuccess		= false;	//tracks whether device successfully enumerated
-static		FILE		USBSerialStream;				//fwrite target for CDC
-volatile	uint8_t		signature[11];					//signature bytes
+
+#ifdef USB_SERIAL
+	
+	uint8_t ReadCalibrationByte( uint8_t index );
+	void ProcessCDCCommand(void);
+
+	uint8_t		configSuccess				= false;		//tracks whether device successfully enumerated
+	static FILE USBSerialStream;							//fwrite target for CDC
+	uint8_t		signature[11];								//signature bytes
+	//print variables
+	volatile	uint8_t		print_char_limit		= 0;
+
+	//appends string to ring buffer and initiates transmission
+	void print(char * str, uint8_t len){
+		if((print_char_limit + len) <= 128){
+			fwrite(str, len, 1, &USBSerialStream);
+			print_char_limit += len;
+			} else {
+			fwrite("X\n",2,1,&USBSerialStream);
+		}
+	}
+#endif
 
 //variables for ProcessCDCCommand()
 volatile	int16_t		cmd, cmd2;
@@ -29,7 +56,6 @@ volatile	uint16_t	ReportStringLength;
 			char *		ReportString;	
 				
 volatile	uint8_t		can_busy			= 0;		//tracks whether the can_handler() subroutine is running
-volatile	uint8_t		print_char_limit	= 0;		//serial output buffer size
 
 //timer variables
 volatile	uint8_t		ten_sec_timer		= 1;		//increments on every sec_timer underflow
@@ -60,8 +86,17 @@ void hw_init(void){
 	XMEGACLK_StartInternalOscillator(CLOCK_SRC_INT_RC32MHZ);
 	XMEGACLK_StartDFLL(CLOCK_SRC_INT_RC32MHZ, DFLL_REF_INT_USBSOF, 48000000);		
 	
+	
+	
 	//turn off everything we don' t use
-	PR.PRGEN		= PR_AES_bm | PR_RTC_bm | PR_DMA_bm;
+	//PR.PRGEN		= PR_AES_bm | PR_RTC_bm | PR_DMA_bm;
+	#ifdef USB_SERIAL
+		//PR.PRGEN		=  PR_AES_bm | PR_RTC_bm | PR_EVSYS_bm | PR_DMA_bm; // stop the clock to AES,RTC,Event system and DMA controller
+		PR.PRGEN		= PR_AES_bm | PR_RTC_bm | PR_DMA_bm;
+	#else
+		PR.PRGEN		= PR_USB_bm | PR_AES_bm | PR_RTC_bm | PR_EVSYS_bm | PR_DMA_bm; // stop the clock to USB, AES,RTC,Event system and DMA controller
+	#endif
+	
 	PR.PRPA			= PR_ADC_bm | PR_AC_bm;
 	PR.PRPC			= PR_TWI_bm | PR_USART0_bm | PR_HIRES_bm;
 	PR.PRPD			= PR_TWI_bm | PR_USART0_bm | PR_TC0_bm | PR_TC1_bm;
@@ -119,8 +154,13 @@ void hw_init(void){
 	
 	PORTB.OUTCLR	= (1 << 0);
 	
+	#ifdef USB_SERIAL
+		USB_Init(USB_OPT_RC32MCLKSRC | USB_OPT_BUSEVENT_PRILOW); //USB on medium level to improve current sense timing precision
+		CDC_Device_CreateStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
+	#endif
+	
 	can_system_init:
-			
+	//DV: HAve no senese the if, always call can_init(MCP_OPMOD_NORMAL,1);		
 	//Init SPI and CAN interface:
 	if(RST.STATUS & RST_WDRF_bm){ //if we come from a watchdog reset, we don't need to setup CAN
 		caninit = can_init(MCP_OPMOD_NORMAL, 1); //on second thought, we do
@@ -139,9 +179,6 @@ void hw_init(void){
 	//Set and enable interrupts with round-robin
 	XMEGACLK_CCP_Write((void * ) &PMIC.CTRL, PMIC_RREN_bm | PMIC_LOLVLEN_bm | PMIC_HILVLEN_bm);//PMIC.CTRL = PMIC_LOLVLEN_bm | PMIC_MEDLVLEN_bm| PMIC_HILVLEN_bm;
 	
-	USB_Init(USB_OPT_RC32MCLKSRC | USB_OPT_BUSEVENT_PRILOW);
-	CDC_Device_CreateStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
-	
 	wdt_enable(WDTO_15MS);
 	
 	sei();
@@ -149,7 +186,7 @@ void hw_init(void){
 
 
 int main(void){
-	char * str = "";
+	//char * str = "";
 	hw_init();
 
     while(1){
@@ -158,70 +195,85 @@ int main(void){
 				sec_interrupt = 0;
 				
 				//sample text output every second
-				str = "ms 0000\n";
-				int_to_4digit_nodec(ms_timer, (char *) (str + 3));
-				print(str,8);
+				//str = "ms 0000\n";
+				//int_to_4digit_nodec(ms_timer, (char *) (str + 3));
+				//print(str,8);*/
+				
+				//Example how to dump one parameter to USB Serial
+				char *data = "        \n";
+				dtostrf((float)LBC_BatteryCurrentSignal/2,3,1,data);
+				fwrite(data, 9, 1, &USBSerialStream);
 			}
 		}
 	}
 }
 
-/* services commands received over the virtual serial port */
-void ProcessCDCCommand(void)
-{
-	ReportStringLength = 0;
-	cmd = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
+
+
+
+#ifdef USB_SERIAL
+	/* Event handler for the LUFA library USB Disconnection event. */
+	void EVENT_USB_Device_Disconnect(void){
+	}
+
+	void EVENT_USB_Device_Connect(void){
+	}
+
+	/* Event handler for the LUFA library USB Configuration Changed event. */
+	void EVENT_USB_Device_ConfigurationChanged(void){
+		configSuccess &= CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
+	}
+
+
+	/* Event handler for the LUFA library USB Control Request reception event. */
+	void EVENT_USB_Device_ControlRequest(void){
+		CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
+	}
+
+
+	/* services commands received over the virtual serial port */
+	void ProcessCDCCommand(void)
+	{
+		uint16_t	ReportStringLength = 0;
+		char *		ReportString = "";
+		int16_t	cmd	 = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
 	
-	if(cmd > -1){
-		switch(cmd){	
-			case 48: //0
+		if(cmd > -1){
+			switch(cmd){
+				case 48: //0
 				break;
-			case 0: //reset when sending 0x00
-			case 90: //'Z' - also reset when typing a printable character (fallback for serial terminals that do not support sending non-printable characters)
+			
+				case 0: //reset
+				case 90: //'Z'
 				_delay_ms(1000);
-				CCP				= CCP_IOREG_gc;			//allow changing CLK.CTRL
-				RST.CTRL		= RST_SWRST_bm;			//perform software reset
+				CCP				= CCP_IOREG_gc;					//allow changing CLK.CTRL
+				RST.CTRL		= RST_SWRST_bm;
 				break;
-			case 64: //@ - dump all CAN messages to USB
+				case 65: //Show info
+				sprintf(ReportString,"GIDS = %u\n",LBC_MY_CHARGE_TIME); ReportStringLength = 8;
+				
+				break; 
+				case 64: //@ - dump all CAN messages to USB
 				output_can_to_serial = 1 - output_can_to_serial;
 				break;
-			case 255: //send ident
-				ReportString = "MUXSAN CAN bridge\n"; ReportStringLength = 18;
+			
+				case 255: //send identity
+				ReportString = "MUXSAN CAN bridge - v1.0 Leaf\n"; ReportStringLength = 30;
 				break;
-					
-			default: //when all else fails
+			
+				default: //when all else fails
 				ReportString = "Unrecognized Command:   \n"; ReportStringLength = 25;
 				ReportString[22] = cmd;
 				break;
-		}
-		if(ReportStringLength){
-			print(ReportString, ReportStringLength);
+			}
+			if(ReportStringLength){
+				fwrite(ReportString, ReportStringLength, 1, &USBSerialStream);
+				Endpoint_ClearIN();
+			}
 		}
 	}
-}
+#endif
 
-// Event handler for the LUFA library USB Disconnection event.
-void EVENT_USB_Device_Disconnect(void){}
-
-void EVENT_USB_Device_Connect(void){}
-
-// Event handler for the LUFA library USB Configuration Changed event.
-void EVENT_USB_Device_ConfigurationChanged(void){ configSuccess &= CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface); }
-
-// Event handler for the LUFA library USB Control Request reception event.
-void EVENT_USB_Device_ControlRequest(void){	CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface); }
-
-//appends string to ring buffer and initiates transmission
-void print(char * str, uint8_t len){
-	if((print_char_limit + len) <= 120){
-		fwrite(str, len, 1, &USBSerialStream);
-		print_char_limit += len;
-	} else { //if the buffer is full, show that by sending an X (happens on very busy CAN buses)
-		fwrite("X\n",2,1,&USBSerialStream);
-	}
-}
-
-//fires every 1ms
 ISR(TCC0_OVF_vect){	
 	wdt_reset();
 	ms_timer++;
@@ -277,16 +329,12 @@ ISR(PORTC_INT0_vect){
 //VCM side of the CAN bus (in Muxsan)
 void can_handler(uint8_t can_bus){	
 	can_frame_t frame;
-	
-	uint8_t mux_5bc_CapCharge = 0;
-	uint8_t	corrected_chargebars = 0;
-	uint16_t total_gids = 0;
-	uint16_t total_voltage = 0;
+	uint8_t remain_charge_condition = 0;
 		
-	char strbuf[] = "1|   |                \n";
+	/*char strbuf[] = "1|   |                \n";
 	if(can_bus == 2){ strbuf[0] = 50; }
 	if(can_bus == 3){ strbuf[0] = 51; }
-		
+	*/		
 	uint8_t flag = can_read(MCP_REG_CANINTF, can_bus);
 		
 	if (flag & (MCP_RX0IF | MCP_RX1IF)){		
@@ -298,209 +346,150 @@ void can_handler(uint8_t can_bus){
 			can_read_rx_buf(MCP_RX_1, &frame, can_bus);
 			can_bit_modify(MCP_REG_CANINTF, MCP_RX1IF, 0x00, can_bus);
 		}		
-		
+/****************************************************************************/
+/*	0x603 => Appears when car is siwtched on								*/
+/*	0x11A => Contains info about the current status of the car (onn/off)	*/
+/*	0x1DB => Contains info about:											*/
+/*				- Instantaneous current consumption							*/
+/*				- Current battery voltage									*/
+/*	0x1DC => When charging (chademo), controls the power delivered			*/
+/*	0x55B => Report State of Charge, not working on models before 2013		*/
+/*	0x8BC => Report info about:												*/
+/*				- Charge time												*/
+/*				- GIDS														*/
+/*	0x1FA => Car charging status											*/			
+/****************************************************************************/
 		switch(frame.can_id){
-			case 0x1DB:
-				//Check what voltage the LBC reports  (10 bits, all 8bits from frame[2], and 2 bits from frame[3] 0xC0)
-				total_voltage = (frame.data[2] << 2) | ((frame.data[3] & 0xC0) >> 6);
-				LBC_BatteryVoltageSignal = (total_voltage/2); //Convert LBC battery voltage to human readable voltage (1 LSB = 0.5V)
-			break;
-			case 0x55B:
-				//Check what SOC the LBC reports  (10 bits, all 8bits from frame[0], and 2 bits from frame[1] 0xC0)
-				LBC_StateOfCharge = (frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6);  //Further improvement idea, modify this also!
+			
+			case 0x603:
+				//Calibration procedure: Each time car starts, we reset power status. 
+				calibration_pending = 1; // required to calibrate GIDs on power on event 
 				break;
-			case 0x5BC: //This frame contains: GIDS, temp readings, capacity bars and mux
-				mux_5bc_CapCharge = (frame.data[4] & 0x0F); //Save the mux containing info if we have capacity or chargebars in the message [8 / 9] Only valid for 2014+!
-				//Filter battery voltage measurement
-				if (voltage_samples < 20) //Keep summing up voltage averages
-				{
-					voltage_sum += LBC_BatteryVoltageSignal;
-					voltage_samples++;
-				}
-				else
-				{
-					filtered_voltage = (voltage_sum/20); //When we have enough samples, write an average (this helps during low SOC)
-					voltage_samples = 0;
-					voltage_sum = 0;
-				}
-
-				if(charging_state != 0x20) //Don't manipulate anything if car is slowcharging. Causes a TDC from TCU otherwise for 2013+ leafs
-				{
-					LBC_MainGids = (frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6); //check how many the stock GIDs the BMS reports (10 bits, all 8bits from frame[0], and 2 bits from frame[1] 0xC0)
-
-					if(LBC_MainGids>=10)
-					{
-						total_gids = (LBC_MainGids + EXTRAGIDS); //This algorithm has a drawback, it wont age as the battery does!
-					
-						if (total_gids >= 320)
-						{
-							corrected_chargebars = 14; //12
-						}
-						else if (total_gids >= 295)
-						{
-							corrected_chargebars = 13; //11
-						}
-						else if (total_gids >= 270)
-						{
-							corrected_chargebars = 12; //10
-						}
-						else if (total_gids >= 245)
-						{
-							corrected_chargebars = 11; //9
-						}
-						else if (total_gids >= 220)
-						{
-							corrected_chargebars = 10; //8
-						}
-						else if (total_gids >= 195)
-						{
-							corrected_chargebars = 9; //7
-						}
-						else if (total_gids >= 170)
-						{
-							corrected_chargebars = 8; //6
-						}
-						else if (total_gids >= 145)
-						{
-							corrected_chargebars = 7; //5
-						}
-						else if (total_gids >= 120)
-						{
-							corrected_chargebars = 6; //4
-						}
-						else if (total_gids >= 95)
-						{
-							corrected_chargebars = 5; //3
-						}
-						else if (total_gids >= 70)
-						{
-							corrected_chargebars = 4; //3
-						}
-						else
-						{
-							corrected_chargebars = 3;
-						}
-					}
-					else if(LBC_MainGids<=9) //There is still some juice left in the battery when it reports 0gids. (ca 30% on a 30kWh bruteforce)
-					{						 //Start estimating SOC from battery voltage
-						if(filtered_voltage >= 347) //7GIDS = 347V on 24kWh LBC (345V is roughly 27% on 30kWh leaf)
-						{
-							total_gids = 60;
-							corrected_chargebars = 3;
-						}
-						else if(filtered_voltage >= 346) //358V = 45% SOC on 30kWh Leaf //351V = 37% SOC on 30kWh Leaf //345V is roughly 27% on 30kWh leaf
-						{
-							total_gids = 57;
-							corrected_chargebars = 3;
-						}
-						else if(filtered_voltage >= 345)
-						{
-							total_gids = 55;
-							corrected_chargebars = 3;
-						}
-						else if(filtered_voltage >= 344)
-						{
-							total_gids = 52;
-							corrected_chargebars = 3;
-						}
-						else if(filtered_voltage >= 343)
-						{
-							total_gids = 48; //at 48gids the stock BMS triggers LBW!
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 342)
-						{
-							total_gids = 45;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 341)
-						{
-							total_gids = 42;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 340)
-						{
-							total_gids = 40;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 339)
-						{
-							total_gids = 38;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 338)
-						{
-							total_gids = 36;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 337) //337V = 21.4%<->18% SOC on 30kWh Leaf (with low mV diff!) (3.51V min)
-						{
-							total_gids = 34;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 336)
-						{
-							total_gids = 32;
-							corrected_chargebars = 2;
-						}
-						else if(filtered_voltage >= 335)
-						{
-							total_gids = 30;
-							corrected_chargebars = 1;
-						}
-						else if(filtered_voltage >= 334)
-						{
-							total_gids = 25;
-							corrected_chargebars = 1;
-						}
-						else if(filtered_voltage >= 333)
-						{
-							total_gids = 20;
-							corrected_chargebars = 1;
-						}
-						else if(filtered_voltage >= 332)
-						{
-							total_gids = 15;
-							corrected_chargebars = 1;
-						}
-						else if(filtered_voltage >= 331)
-						{
-							total_gids = 10;
-							corrected_chargebars = 1;
-						}
-						else if(filtered_voltage >= 330)
-						{
-							total_gids = 5;
-							corrected_chargebars = 0;
-						}
-						else if(filtered_voltage <= 329) //Contactors will open at ~300V, but it's not worth mapping this area. One single cell can trigger turtle quite easily here.
-						{
-							total_gids = LBC_MainGids;
-							corrected_chargebars = 0;
-						}
-						else
-						{
-							total_gids = LBC_MainGids;
-							corrected_chargebars = 0;
-						}
-					}
-					//Add the total GIDs
-					frame.data[0] = (uint8_t) (total_gids >> 2);
-					frame.data[1] = (uint8_t) ((frame.data[1] & 0x3F) | (total_gids & 3) << 6);
-				
-					//Write capacity and charge bars (this is only valid for AZE0 leaf)
-					if (mux_5bc_CapCharge == 9) //Only when the muxed field is equal to 9, capacity bars can be written
-					{
-						//frame.data[2] = (uint8_t) ((frame.data[2] & 0x0F) | spoofed_capacity << 4); //This will write 15/15, causing capacity to read full. Useful if you cannot reset the BMS
-					}
-					else if (mux_5bc_CapCharge == 8) //Only when the muxed field is equal to 8, charge bars can be written
-					{
-						frame.data[2] = (uint8_t) ((frame.data[2] & 0x0F) | corrected_chargebars << 4);
-					}
-				}
+			case 0x11A:
+				poweroff = (frame.data[1] >> 5) == 4; // 3 => on, 4 => Off
 			break;
-			case 0x1F2: //Collect the charging state (Needed for 2013+ Leafs, throws DTC otherwise) [VCM->LBC]
+			case 0x1DB:
+				
+				//Check voltage reported by the LBC  (10 bits, all 8bits from frame[2], and 2 bits from frame[3] 0xC0)
+				LBC_BatteryVoltageSignal = (uint16_t)((frame.data[2] << 2) | ((frame.data[3] & 0xC0) >> 6));
+				 
+				//Check current reported by the LBC
+				LBC_BatteryCurrentSignal = ((frame.data[0] << 3) | ((frame.data[1]) >> 5)); //Data in 2's comp
+				if(LBC_BatteryCurrentSignal & 0x0400) LBC_BatteryCurrentSignal |= 0xf800;
+				LBC_BatteryCurrentSignal = (int16_t)(-LBC_BatteryCurrentSignal) + 1;
+				
+				//Calibration time?
+				if (calibration_pending == 1) { // on power on event, calibrate GIDs with voltage
+					if(LBC_BatteryVoltageSignal > LBC_MIN_VALID_VOLTS && LBC_BatteryVoltageSignal < LBC_MAX_VALID_VOLTS) { // Check if voltage is in range
+						LBC_PowerStatus = ((LBC_BatteryVoltageSignal / 2) - ZERO_WATTS_VOLT)* WATTS_PER_VOLT; //Remember, we are working with 0.5V per LSB
+						calibration_pending = 0;
+					} else {
+						calibration_pending = 1;
+					}
+				} else {
+					if(((LBC_BatteryVoltageSignal > LBC_MIN_VALID_VOLTS) && (LBC_BatteryVoltageSignal < LBC_MAX_VALID_VOLTS)) && ((LBC_BatteryCurrentSignal > LBC_MIN_VALID_AMPS) && (LBC_BatteryCurrentSignal < LBC_MAX_VALID_AMPS) )) { // Check current is on range
+						if(power_samples < GIDS_MEASURE_CYLES) { // while cycles are not reached keeps increasing power_sum
+							power_sum = power_sum + ((float)(LBC_BatteryVoltageSignal/2.0) * (float)(LBC_BatteryCurrentSignal /2.0)) / 3600; // reads power, and accumulate it. the reading is each 10ms,																		  // each 100 measures is a second and 3600 secs per hour
+							power_samples++;
+						} else {
+							LBC_PowerStatus = LBC_PowerStatus - power_sum/100; // decreases from total available power
+							power_samples	= 0;
+							power_sum		= 0;
+						}
+					}
+				}
+				//To avoid going under 0
+				if(LBC_PowerStatus < 0) {
+					LBC_PowerStatus = 0;
+				}
+				calc_crc8(&frame);
+			break;
+			
+			case 0x1DC:
+				
+				if( charging_state == CHARGING_QUICK_START || charging_state == CHARGING_QUICK) {
+					chademo_power_rate = ((frame.data[2] << 6) & 0x3C0) | ((frame.data[3] >> 2) & 0x3F);
+					switch(frame.data[3] & 0x03) {
+						case 0x00:
+						NULL;	//Leave for future configurations.
+						break;
+						case 0x01:
+							if(charging_state == CHARGING_QUICK){ chademo_power_rate = 0x3E58;}
+						break;
+						case 0x02:
+							if(charging_state == CHARGING_QUICK){ chademo_power_rate = 0x3FFF;}
+						break;
+						case 0x03:
+							if(charging_state == CHARGING_QUICK_START){ chademo_power_rate = 0x3C64;}
+							if(charging_state == CHARGING_QUICK){ chademo_power_rate = 0x3E58; }
+						break;
+					}
+				}
+				
+				
+				frame.data[2] = (frame.data[2] & 0xF0) | ((chademo_power_rate >> 8) & 0xF);
+				frame.data[3] = (uint8_t) (chademo_power_rate & 0xFF);
+				calc_crc8(&frame);
+				
+				if (charging_wait_b4_set_current  > 0) {charging_wait_b4_set_current--;};
+				//At charging start, we wait for CURRENT_SET_WAITING_TIME to start demanding current
+				if(charging_state == CHARGING_QUICK_START) {
+					charging_wait_b4_set_current = CURRENT_SET_WAITING_TIME;
+				}	
+				break;
+
+			case 0x55B:
+				
+				//Check what SOC the LBC reports  (10 bits, all 8bits from frame[0], and 2 bits from frame[1] 0xC0)
+				//state_of_charge = (frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6);  //Further improvement idea, modify this also!	
+				LBC_StateOfCharge = (((LBC_BatteryVoltageSignal/2 - ZERO_WATTS_VOLT)) * 32) / 3; //State of charge.
+				
+				frame.data[0]  = (uint8_t) LBC_StateOfCharge >> 2;
+				frame.data[1]  = (uint8_t) ((LBC_StateOfCharge << 6) & 0x03) | (frame.data[1] & 0x3F);
+				calc_crc8(&frame);
+				break;		
+				
+			case 0x5BC: //This frame contains: GIDS, temp readings, capacity bars and mux
+				//When car powered off, we keep GIDS volts calculation. In this case range will go from 0 to 288GIDS (the original range)
+				//This is done to avoid problems with certain chademo chargers. It looks like the chademo check the correlation between 
+				//Battery pack volts and GIDS.
+				
+				//Let's check mode: full or current charge
+				if(!poweroff) {
+					if((charging_state != CHARGING_SLOW) && (charging_state != CHARGING_QUICK) && (charging_state != CHARGING_QUICK_START)) {
+						
+						total_gids = (LBC_PowerStatus / UNITY_GIDS);
+
+					} else {
+						
+						total_gids = (uint16_t) ((((LBC_BatteryVoltageSignal /2) - ZERO_WATTS_VOLT) ) * GIDS_PER_VOLT); //Voltage based estimation 3 GIDS/V. We need it becouse of uint16 limits
+						
+					}
+					
+				} else {
+						//Fix value to allow ABB chargers to work and has no impact on others Chademo chargers tested.
+						total_gids = 200; 
+				}
+				//Build custom frame.
+				frame.data[0] = (uint8_t) (total_gids >> 2);
+				frame.data[1] = (uint8_t) ((frame.data[1] & 0x3F) | ((total_gids & 0x03) << 6));
+				
+				//Set the charging time to fixed value: LBC_MY_CHARGE_TIME when charge condition is TODO TODO
+				remain_charge_condition = ((frame.data[5] & 0x03) << 3) | ((frame.data[6] >> 5) & 0x07);
+				if(remain_charge_condition == 0x00) { 
+					//Quick charge and we must sent modified remaining time
+					frame.data[6] = (uint8_t) ((LBC_MY_CHARGE_TIME >> 8) | (frame.data[6] & 0xE0));
+					frame.data[7] = (uint8_t) (LBC_MY_CHARGE_TIME & 0xFF);
+				}
+				
+				
+			break;
+			
+			case 0x1F2: 
+				//Collect the charging state (Needed for 2013+ Leafs, throws DTC otherwise) [VCM->LBC]
+				
 				charging_state = frame.data[2];
+			
 			break;
 			default:
 			break;
@@ -523,9 +512,16 @@ void can_handler(uint8_t can_bus){
 				if(can_bus == 1){send_can2(frame);} else {send_can1(frame);}
 								
 				if(output_can_to_serial){
-					SID_to_str(strbuf + 2, frame.can_id);
+					/*SID_to_str(strbuf + 2, frame.can_id);
 					canframe_to_str(strbuf + 6, frame);
+					sprintf(strbuf,"%f",LBC_PowerStatus);
 					print(strbuf,23);
+					*/
+					char *data = "     \n";
+					dtostrf(LBC_PowerStatus,3,2,data);
+					
+					fwrite(data, 9, 1, &USBSerialStream);
+					
 				}
 			}
 		}		
